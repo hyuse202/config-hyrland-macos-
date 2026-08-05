@@ -1,0 +1,269 @@
+"""
+Centralized configuration service with file watching and dynamic reloads.
+
+This service encapsulates the logic for loading the application's JSON config,
+watching for file changes, and notifying registered listeners when the config
+changes. It is implemented as a singleton and intended to be reused by any
+module that needs dynamic configuration.
+"""
+
+import weakref
+from typing import Any, Callable, Dict, List, Optional
+
+from fabric.utils import Gio, GLib, logger, os
+from tomlkit import document as toml_document
+from tomlkit import dump as toml_dump
+from tomlkit import item as toml_item
+from tomlkit import load as toml_load
+from tomlkit import loads as toml_loads
+
+from utils.gtk_utils import toml_file
+
+
+class ConfigService:
+    """Singleton service handling config state and reload notifications."""
+
+    _instance: Optional["ConfigService"] = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if getattr(self, "_initialized", False):
+            return
+
+        self._config: Any = {}
+        self._reload_callbacks: List[
+            Callable[[Dict[str, Any], Dict[str, Any]], None]
+        ] = []
+        self._config_file: str = toml_file("config.toml")
+        self._monitors: List[Gio.FileMonitor] = []
+        self._reload_pending: bool = False
+        self.RELOAD_DELAY_MS: int = 100
+
+        self._load_config()
+        self._last_notified_config = self._config.copy()
+        self._setup_monitors()
+        self._initialized = True
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get a config value. Supports dot notation for nested keys (e.g. 'dock.enabled')."""
+        parts = key.split(".")
+        current = self._config
+        for part in parts:
+            if isinstance(current, dict):
+                current = current.get(part)
+                if current is None:
+                    return default
+            else:
+                return default
+        return current
+
+    def get_all(self) -> Dict[str, Any]:
+        return self._config.copy()
+
+    def has_changed(self, key: str, old_config: Dict[str, Any]) -> bool:
+        """Check if a config value changed. Supports dot notation for nested keys."""
+
+        def _get_nested(d, k):
+            parts = k.split(".")
+            current = d
+            for part in parts:
+                if isinstance(current, dict):
+                    current = current.get(part)
+                    if current is None:
+                        return None
+                else:
+                    return None
+            return current
+
+        return _get_nested(self._config, key) != _get_nested(old_config, key)
+
+    def set(self, key: str, value: Any) -> None:
+        """Set a config value (local state only). Supports dot notation for nested keys."""
+        parts = key.split(".")
+        current = self._config
+        for part in parts[:-1]:
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+        current[parts[-1]] = value
+
+    def save(self) -> None:
+        """Persist current in-memory config to disk."""
+        try:
+            doc = self._dict_to_toml(self._config)
+            with open(self._config_file, "w") as f:
+                toml_dump(doc, f)
+        except Exception as e:
+            logger.error(f"[ConfigService] Failed to save config: {e}")
+
+    def register_reload_callback(
+        self, callback: Callable[[Dict[str, Any], Dict[str, Any]], None]
+    ) -> None:
+        live = []
+        for ref in self._reload_callbacks:
+            existing = ref()
+            if existing is None:
+                continue
+            live.append(ref)
+            if existing == callback:
+                self._reload_callbacks = live
+                return
+        live.append(self._weak_callback_ref(callback))
+        self._reload_callbacks = live
+
+    def unregister_reload_callback(
+        self, callback: Callable[[Dict[str, Any], Dict[str, Any]], None]
+    ) -> None:
+        self._reload_callbacks = [
+            ref
+            for ref in self._reload_callbacks
+            if ref() is not None and ref() != callback
+        ]
+
+    @staticmethod
+    def _weak_callback_ref(callback):
+        try:
+            return weakref.WeakMethod(callback)
+        except TypeError:
+            return weakref.ref(callback)
+
+    @staticmethod
+    def _dict_to_toml(d: dict) -> Any:
+        doc = toml_document()
+        for k, v in d.items():
+            doc.add(k, toml_item(v))
+        return doc
+
+    def _load_config(self) -> None:
+        try:
+            if os.path.exists(self._config_file):
+                with open(self._config_file) as f:
+                    self._config = toml_load(f)
+            else:
+                try:
+                    from utils.constants import generate_default_toml
+
+                    os.makedirs(os.path.dirname(self._config_file), exist_ok=True)
+                    raw = generate_default_toml()
+                    self._config = toml_loads(raw)
+                    with open(self._config_file, "w") as f:
+                        f.write(raw)
+                    logger.info(
+                        f"[ConfigService] Generated default config at {self._config_file}"
+                    )
+                except ImportError as e:
+                    logger.error(f"[ConfigService] Failed to import defaults: {e}")
+                    self._config = {}
+                except Exception as e:
+                    logger.error(
+                        f"[ConfigService] Failed to generate default config: {e}"
+                    )
+                    self._config = {}
+        except Exception as e:
+            logger.error(f"[ConfigService] Failed to load config: {e}")
+            self._config = {}
+
+    def _setup_monitors(self) -> None:
+        files_to_watch = [self._config_file, os.path.dirname(self._config_file)]
+        for file_path in files_to_watch:
+            if not os.path.exists(file_path):
+                continue
+            try:
+                gio_file = Gio.File.new_for_path(file_path)
+                monitor = gio_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
+                monitor.connect("changed", self._on_file_changed, file_path)
+                self._monitors.append(monitor)
+            except Exception as e:
+                logger.error(f"[ConfigService] Failed to monitor {file_path}: {e}")
+
+    def _on_file_changed(self, monitor, file, _other_file, event_type, file_path: str):
+        # The parent-directory monitor fires for every file in the config dir
+        # (.swp, lockfiles, desktop.toml, ...). Only react to the config file
+        # itself so unrelated files don't trigger a reload + callback fan-out.
+        if file.get_path() != self._config_file:
+            return
+        # Trigger on various change events to be more robust across editors/OSs
+        valid_events = [
+            Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+            Gio.FileMonitorEvent.CHANGED,
+            Gio.FileMonitorEvent.CREATED,
+            Gio.FileMonitorEvent.DELETED,
+        ]
+        if event_type in valid_events and not self._reload_pending:
+            self._reload_pending = True
+            GLib.timeout_add(self.RELOAD_DELAY_MS, self._reload_config)
+
+    def _reload_config(self) -> bool:
+        try:
+            self._reload_pending = False
+            old_config = self._last_notified_config.copy()
+            self._load_config()
+
+            if self._config == old_config:
+                # Nothing actually changed (e.g. mtime-only touch): skip the
+                # callback fan-out.
+                return False
+
+            # Always notify listeners on reload request to be safe
+            alive_callbacks = []
+            for ref in self._reload_callbacks:
+                callback = ref()
+                if callback is None:
+                    continue
+                alive_callbacks.append(ref)
+                try:
+                    callback(self._config, old_config)
+                except Exception as e:
+                    logger.error(f"[ConfigService] Callback failed: {e}")
+            self._reload_callbacks = alive_callbacks
+
+            self._last_notified_config = self._config.copy()
+            return False
+        except Exception as e:
+            logger.error(f"[ConfigService] Failed to reload configuration: {e}")
+            self._reload_pending = False
+            return False
+
+
+_service: Optional[ConfigService] = None
+
+
+def start_config_service() -> ConfigService:
+    global _service
+    if _service is None:
+        _service = ConfigService()
+    return _service
+
+
+# Convenience helpers for concise usage
+def config() -> ConfigService:
+    """Get the singleton service (concise alias)."""
+    return start_config_service()
+
+
+def get_config(key: str, default: Any = None) -> Any:
+    """Get a single config value from the singleton service."""
+    return start_config_service().get(key, default)
+
+
+def get_config_all() -> Dict[str, Any]:
+    """Get the entire current configuration state."""
+    return start_config_service().get_all()
+
+
+def on_config_change(
+    callback: Callable[[Dict[str, Any], Dict[str, Any]], None],
+) -> None:
+    """Register a reload callback on the singleton service."""
+    start_config_service().register_reload_callback(callback)
+
+
+def off_config_change(
+    callback: Callable[[Dict[str, Any], Dict[str, Any]], None],
+) -> None:
+    """Unregister a reload callback from the singleton service."""
+    start_config_service().unregister_reload_callback(callback)

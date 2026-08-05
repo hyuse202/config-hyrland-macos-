@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Hyprland
+Comment=Hyprland session via uwsm (Modus shell)
+Exec=/usr/local/bin/uwsm start -- Hyprland
+DesktopNames=Hyprland
+Type=Application

@@ -1,0 +1,11 @@
+[config]
+reload_apps = true
+
+[templates.modus]
+input_path = "~/.config/Modus/config/matugen/templates/modus.css"
+output_path = "~/.config/Modus/src/styles/colors.css"
+post_hook = "fabric-cli exec modus 'app.set_css()' &"
+
+[templates.hyprland]
+input_path = "~/.config/Modus/config/matugen/templates/hyprland-colors.lua"
+output_path = "~/.config/Modus/config/hypr/colors.lua"

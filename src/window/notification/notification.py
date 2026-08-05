@@ -1,0 +1,1477 @@
+import hashlib
+import time
+
+from fabric.notifications import (
+    Notification,
+    NotificationAction,
+    NotificationCloseReason,
+)
+from fabric.utils import Gdk, GdkPixbuf, GLib, Gtk, logger, os
+from fabric.widgets.box import Box
+from fabric.widgets.button import Button
+from fabric.widgets.eventbox import EventBox
+from fabric.widgets.image import Image
+from fabric.widgets.label import Label
+from fabric.widgets.revealer import Revealer
+from fabric.widgets.wayland import WaylandWindow as Window
+
+import shared.data as data
+from services.config import get_config, off_config_change, on_config_change
+from services.modus import notification_service
+from shared.widgets.clipping_box import ClippingBox
+from shared.widgets.close_button_revealer import CloseButtonRevealerMixin
+from shared.widgets.custom_image import CustomImage
+from shared.widgets.customrevealer import SlideRevealer
+from utils.gtk_utils import setup_cursor_hover
+from utils.functions import escape_markup_text
+from utils.roam import modus_service
+from utils.icon_resolver import IconResolver
+
+# ruff: noqa: I001
+from window.notification.unified_cache import (
+    UNIFIED_NOTIFICATION_CACHE_DIR as _SHARED_NOTIFICATION_CACHE_DIR,
+    cleanup_cache as _unified_cleanup_cache,
+    cleanup_old_cache_files as _unified_cleanup_old_cache_files,
+    ensure_cache_dir as _ensure_unified_cache_dir,
+    get_fallback_icon as _shared_fallback_icon,
+    get_from_cache as _unified_get_from_cache,
+    get_unified_cache_key,
+    save_to_cache as _unified_save_to_cache,
+)
+
+_icon_resolver = IconResolver()
+
+NOTIFICATION_WIDTH = 360
+NOTIFICATION_IMAGE_SIZE = 48
+
+# Use shared unified cache directory from unified_cache
+NOTIFICATION_ICON_CACHE_DIR = _SHARED_NOTIFICATION_CACHE_DIR
+NOTIFICATION_IMAGE_CACHE_DIR = _SHARED_NOTIFICATION_CACHE_DIR
+
+
+def ensure_notification_cache_dirs():
+    """Ensure unified notification cache directory exists"""
+    _ensure_unified_cache_dir()
+
+
+def cleanup_old_cache_files():
+    """Clean up old notification cache files (older than 7 days)"""
+    try:
+        _unified_cleanup_old_cache_files()
+    except Exception as e:
+        logger.warning(f"Failed to cleanup notification cache: {e}")
+
+
+get_cache_key = get_unified_cache_key
+
+
+def save_pixbuf_to_cache(pixbuf, cache_key, cache_dir):
+    """Save a pixbuf to the specified cache directory"""
+    try:
+        ensure_notification_cache_dirs()
+        # Delegate to unified cache; ignore returned key for compatibility
+        result = _unified_save_to_cache(pixbuf, cache_key)
+        if result and result[0]:
+            return result[0]
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to cache notification icon: {e}")
+        return None
+
+
+def get_cached_pixbuf(cache_key, fallback_size=(48, 48), cache_dir=None):
+    """Get a cached pixbuf or return None if not found"""
+    if cache_dir is None:
+        cache_dir = NOTIFICATION_ICON_CACHE_DIR
+
+    try:
+        pixbuf = _unified_get_from_cache(cache_key, fallback_size)
+        if pixbuf:
+            return pixbuf
+    except Exception as e:
+        logger.warning(f"Failed to load cached notification icon: {e}")
+    return None
+
+
+def cache_notification_icon(source, size=(48, 48), app_name=None):
+    """Optimized notification icon caching with immediate pixbuf generation and caching"""
+    try:
+        ensure_notification_cache_dirs()
+
+        # Handle different source types with optimized caching
+        if isinstance(source, str):
+            cache_key = get_unified_cache_key(source, size, app_name)
+
+            # Check cache first for immediate return
+            cached_pixbuf = get_cached_pixbuf(
+                cache_key, fallback_size=size, cache_dir=NOTIFICATION_ICON_CACHE_DIR
+            )
+            if cached_pixbuf:
+                return cached_pixbuf
+
+            # Load, cache, and return icon in one optimized flow
+            if source.startswith("file://"):
+                # Local file URL - process and cache immediately
+                file_path = source[7:]
+                pixbuf = load_and_cache_local_icon(file_path, cache_key, size)
+            elif os.path.exists(source):
+                # Direct file path - process and cache immediately
+                pixbuf = load_and_cache_local_icon(source, cache_key, size)
+            else:
+                # Icon name - resolve from theme and cache immediately
+                pixbuf = load_and_cache_theme_icon(source, cache_key, size)
+
+            return pixbuf
+
+        elif hasattr(source, "scale_simple"):
+            # Already a pixbuf - cache it directly with optimized flow
+            cache_key = get_unified_cache_key(source, size, app_name)
+
+            # Check cache first
+            cached_pixbuf = get_cached_pixbuf(
+                cache_key, fallback_size=size, cache_dir=NOTIFICATION_ICON_CACHE_DIR
+            )
+            if cached_pixbuf:
+                return cached_pixbuf
+
+            # Scale once and cache immediately
+            scaled_pixbuf = source.scale_simple(
+                size[0], size[1], GdkPixbuf.InterpType.BILINEAR
+            )
+            save_pixbuf_to_cache(scaled_pixbuf, cache_key, NOTIFICATION_ICON_CACHE_DIR)
+            return scaled_pixbuf
+
+    except Exception as e:
+        logger.warning(f"Failed to cache notification icon: {e}")
+
+    # Return fallback with caching
+    return get_fallback_notification_icon(size)
+
+
+def load_and_cache_local_icon(file_path, cache_key, size):
+    """Load a local icon file and cache it"""
+    try:
+        if os.path.exists(file_path):
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                file_path, size[0], size[1], True
+            )
+            save_pixbuf_to_cache(pixbuf, cache_key, NOTIFICATION_ICON_CACHE_DIR)
+            return pixbuf
+    except Exception as e:
+        logger.warning(f"Failed to load local notification icon {file_path}: {e}")
+
+    return get_fallback_notification_icon(size)
+
+
+def load_and_cache_theme_icon(icon_name, cache_key, size):
+    """Load an icon from the current theme and cache it"""
+    try:
+        icon_theme = Gtk.IconTheme.get_default()
+        pixbuf = None
+        try:
+            pixbuf = icon_theme.load_icon(
+                icon_name, size[0], Gtk.IconLookupFlags.FORCE_SIZE
+            )
+        except GLib.Error:
+            # Try common suffixed variants
+            for suffix in ("-symbolic", "-desktop", ""):
+                try:
+                    pixbuf = icon_theme.load_icon(
+                        icon_name + suffix, size[0], Gtk.IconLookupFlags.FORCE_SIZE
+                    )
+                    if pixbuf:
+                        break
+                except GLib.Error:
+                    continue
+        if pixbuf:
+            save_pixbuf_to_cache(pixbuf, cache_key, NOTIFICATION_ICON_CACHE_DIR)
+            return pixbuf
+    except Exception as e:
+        logger.warning(f"Failed to load theme icon {icon_name}: {e}")
+
+    return get_fallback_notification_icon(size)
+
+
+def get_fallback_notification_icon(size=(48, 48)):
+    return _shared_fallback_icon(size)
+
+
+def _resize_pixbuf_to(pixbuf, size):
+    """Scale a pixbuf to ``size``, short-circuiting when already that size."""
+    width, height = size
+    if (
+        pixbuf is not None
+        and pixbuf.get_width() == width
+        and pixbuf.get_height() == height
+    ):
+        return pixbuf
+    try:
+        return pixbuf.scale_simple(width, height, GdkPixbuf.InterpType.BILINEAR)
+    except Exception as e:
+        logger.warning(f"[notification] Failed to scale pixbuf to {size}: {e}")
+        return pixbuf
+
+
+def get_notification_pixbuf(
+    notification,
+    cache_metadata=None,
+    target_size=(64, 64),
+    include_live_image=True,
+):
+    """Resolve a notification thumbnail via the shared cache cascade.
+
+    Order: cached notification image (by key) -> live ``image_pixbuf``
+    (only when ``include_live_image``) -> cached app icon -> directly
+    cached app icon -> fallback icon. Never rescales a pixbuf that is
+    already at ``target_size``.
+
+    Shared by the popup widget and the notification center (previously
+    three near-verbatim copies).
+    """
+    meta = (
+        cache_metadata
+        if cache_metadata is not None
+        else (getattr(notification, "cache_metadata", None) or {})
+    )
+    pixbuf = None
+
+    if isinstance(meta, dict):
+        notif_key = meta.get("notification_image_cache_key")
+        if notif_key:
+            try:
+                pixbuf = get_cached_notification_image(notif_key)
+            except Exception as e:
+                logger.warning(
+                    f"[notification] Failed to load cached notification image: {e}"
+                )
+
+    if not pixbuf and include_live_image:
+        try:
+            img = getattr(notification, "image_pixbuf", None)
+            if img is not None:
+                nid = getattr(notification, "id", 0)
+                ck = get_notification_image_cache_key(nid, img)
+                cached = get_cached_notification_image(ck)
+                pixbuf = cached if cached else img
+        except Exception as e:
+            logger.warning(f"[notification] Failed to load notification image: {e}")
+
+    if not pixbuf and isinstance(meta, dict):
+        app_key = meta.get("app_icon_cache_key")
+        if app_key:
+            try:
+                pixbuf = _unified_get_from_cache(app_key, target_size)
+            except Exception as e:
+                logger.warning(f"[notification] Failed to load cached app icon: {e}")
+
+    if not pixbuf:
+        app_icon = getattr(notification, "app_icon", None) or getattr(
+            notification, "app_name", None
+        )
+        if app_icon:
+            try:
+                pixbuf = cache_notification_icon(app_icon, target_size)
+            except Exception as e:
+                logger.warning(f"[notification] Failed to cache app icon: {e}")
+
+    if not pixbuf:
+        pixbuf = get_fallback_notification_icon(target_size)
+
+    return _resize_pixbuf_to(pixbuf, target_size)
+
+
+def get_notification_image_cache_key(notification_id, image_pixbuf):
+    """Generate a deterministic cache key based on image content to prevent duplicate caching"""
+    try:
+        # Use image content hash for deterministic caching
+        if image_pixbuf and hasattr(image_pixbuf, "get_pixels"):
+            try:
+                pixel_data = image_pixbuf.get_pixels()
+                image_hash = hashlib.md5(pixel_data).hexdigest()[:8]
+                return image_hash
+            except Exception:
+                # If pixel data fails, use image dimensions + timestamp
+                try:
+                    width = image_pixbuf.get_width()
+                    height = image_pixbuf.get_height()
+                    dimension_hash = hashlib.md5(
+                        f"{width}x{height}".encode()
+                    ).hexdigest()[:8]
+                    return dimension_hash
+                except Exception as e:
+                    logger.error(f"An error occurred: {e}")
+
+        # Fallback to timestamp for invalid pixbufs
+        return str(int(time.time()))[:8]
+    except Exception as e:
+        # Ultimate fallback
+        logger.warning(
+            f"[notification] if image_pixbuf and hasattr(image_pixbuf, 'get_pixels'): ... failed: {e}"
+        )
+        return str(int(time.time()))[:8]
+
+
+def cache_notification_image(notification_id, image_pixbuf, size=(64, 64)):
+    """Smart notification image caching that avoids duplicate caching"""
+    try:
+        ensure_notification_cache_dirs()
+
+        # Generate deterministic cache key based on image content
+        cache_key = get_notification_image_cache_key(notification_id, image_pixbuf)
+        try:
+            # Let unified cache handle scaling and saving
+            saved_path, _ = _unified_save_to_cache(image_pixbuf, cache_key, size)
+            if saved_path:
+                return saved_path, cache_key
+            return None, None
+        except Exception as scale_error:
+            logger.debug(
+                f"Failed to cache image (temp file likely gone): {scale_error}"
+            )
+            return None, None
+
+    except Exception as e:
+        logger.warning(f"Failed to cache notification image: {e}")
+        return None, None
+
+
+def get_cached_notification_image(cache_key):
+    """Get a cached notification image or return None if not found"""
+    try:
+        return _unified_get_from_cache(cache_key)
+    except Exception as e:
+        logger.warning(f"Failed to load cached notification image: {e}")
+    return None
+
+
+def cleanup_notification_image_cache(cache_key=None):
+    """Clean up notification image cache - specific key or all"""
+    try:
+        ensure_notification_cache_dirs()
+        _unified_cleanup_cache(cache_key)
+    except Exception as e:
+        logger.warning(f"Failed to cleanup notification image cache: {e}")
+
+
+def cleanup_notification_specific_caches(
+    app_icon_source=None, notification_image_cache_key=None
+):
+    """Clean up caches specific to a notification (both app icon and notification image) - SINGLE ICON SIZE"""
+    try:
+        # Clean up notification image cache
+        if notification_image_cache_key:
+            _unified_cleanup_cache(notification_image_cache_key)
+
+        # Clean up app icon cache for this specific source (only 64x64 version)
+        if app_icon_source:
+            # Only clean 64x64 version since we only cache this size now
+            cache_key_64 = get_unified_cache_key(app_icon_source, (64, 64))
+            _unified_cleanup_cache(cache_key_64)
+
+    except Exception as e:
+        logger.warning(f"Failed to cleanup notification specific caches: {e}")
+
+
+def cleanup_all_notification_caches():
+    """Clean up ALL notification caches (icons and images)"""
+    try:
+        _unified_cleanup_cache()
+    except Exception as e:
+        logger.warning(f"Failed to cleanup all notification caches: {e}")
+
+
+def verify_cache_persistence():
+    """Verify that cached icons persist and can be loaded after restart"""
+    try:
+        icon_cache_files = []
+        image_cache_files = []
+
+        if os.path.exists(NOTIFICATION_ICON_CACHE_DIR):
+            icon_cache_files = [
+                f for f in os.listdir(NOTIFICATION_ICON_CACHE_DIR) if f.endswith(".png")
+            ]
+
+        if os.path.exists(NOTIFICATION_IMAGE_CACHE_DIR):
+            image_cache_files = [
+                f
+                for f in os.listdir(NOTIFICATION_IMAGE_CACHE_DIR)
+                if f.endswith(".png")
+            ]
+
+        # Test loading a few cached items to verify they work
+        for cache_file in icon_cache_files[:2]:  # Test first 2 icon files
+            try:
+                cache_path = os.path.join(NOTIFICATION_ICON_CACHE_DIR, cache_file)
+                GdkPixbuf.Pixbuf.new_from_file(cache_path)
+            except Exception as e:
+                logger.warning(f"Failed to load cached icon {cache_file}: {e}")
+
+        for cache_file in image_cache_files[:2]:  # Test first 2 image files
+            try:
+                cache_path = os.path.join(NOTIFICATION_IMAGE_CACHE_DIR, cache_file)
+                GdkPixbuf.Pixbuf.new_from_file(cache_path)
+            except Exception as e:
+                logger.warning(f"Failed to load cached image {cache_file}: {e}")
+
+        return len(icon_cache_files) + len(image_cache_files) > 0
+
+    except Exception as e:
+        logger.error(f"Failed to verify cache persistence: {e}")
+        return False
+
+
+def migrate_persistent_notifications():
+    """Migrate persistent notifications to use cached assets when temp files are gone"""
+    try:
+        from services.modus import notification_service
+
+        migrated_count = 0
+        for cached_notification in notification_service.cached_notifications:
+            notification = cached_notification._notification
+
+            # Check if notification has image_pixbuf but temp file might be gone
+            if hasattr(notification, "image_pixbuf") and notification.image_pixbuf:
+                try:
+                    # Try to access pixel data to test if temp file still exists
+                    notification.image_pixbuf.get_pixels()
+                except Exception:
+                    # Temp file is gone, ensure app icon is cached as fallback
+                    try:
+                        if hasattr(notification, "app_icon") and notification.app_icon:
+                            cache_notification_icon(notification.app_icon, (64, 64))
+                            migrated_count += 1
+
+                    except Exception as cache_error:
+                        logger.debug(
+                            f"Failed to cache app icon for {notification.app_name}: {
+                                cache_error
+                            }"
+                        )
+
+    except Exception as e:
+        logger.warning(f"Failed to migrate persistent notifications: {e}")
+
+
+# Initialize cache and verify persistence on module load
+ensure_notification_cache_dirs()
+cleanup_old_cache_files()
+verify_cache_persistence()
+
+# Run migration for persistent notifications on startup
+try:
+    migrate_persistent_notifications()
+except Exception as e:
+    logger.debug(f"Migration skipped (service not ready): {e}")
+
+
+def preload_notification_assets(notification):
+    """Preload and cache notification assets with robust error handling for persistent notifications - SINGLE ICON SIZE"""
+    try:
+        # Cache app icon only at content size (64x64) - scale down for headers at runtime
+        if hasattr(notification, "app_icon") and notification.app_icon:
+            try:
+                # Only cache at 64x64 to reduce disk usage - headers will scale this down
+                cache_notification_icon(notification.app_icon, (64, 64))
+            except Exception as icon_error:
+                logger.debug(
+                    f"Failed to preload app icon for {notification.app_name}: {
+                        icon_error
+                    }"
+                )
+
+        # Cache notification image if available
+        if hasattr(notification, "image_pixbuf") and notification.image_pixbuf:
+            cache_notification_image(
+                notification.id, notification.image_pixbuf, (128, 128)
+            )
+
+    except Exception as e:
+        logger.warning(f"Failed to preload notification assets: {e}")
+
+
+def smooth_revealer_animation(revealer: SlideRevealer, duration: int = 280):
+    """Configure revealer for ultra-smooth animation"""
+    revealer.duration = duration
+
+
+class ActionButton(Button):
+    def __init__(
+        self, action: NotificationAction, index: int, total: int, notification_box
+    ):
+        super().__init__(
+            name="action-button",
+            h_expand=True,
+            on_clicked=self.on_clicked,
+            child=Label(name="button-label", label=action.label),
+        )
+        self.action = action
+        self.notification_box = notification_box
+        style_class = (
+            "start-action"
+            if index == 0
+            else "end-action"
+            if index == total - 1
+            else "middle-action"
+        )
+        self.add_style_class(style_class)
+        self.connect(
+            "enter-notify-event", lambda *_: notification_box.hover_button(self)
+        )
+        self.connect(
+            "leave-notify-event", lambda *_: notification_box.unhover_button(self)
+        )
+
+    def on_clicked(self, *_):
+        # Mark for cache cleanup when action button is clicked
+        self.notification_box._should_cleanup_cache = True
+        self.action.invoke()
+        self.action.parent.close("dismissed-by-user")
+
+
+def _get_urgency_class(notification: Notification) -> str:
+    urgency = getattr(notification, "urgency", None)
+    if urgency is None:
+        return "normal"
+    urgency_str = str(urgency).lower()
+    if "low" in urgency_str:
+        return "low"
+    if "critical" in urgency_str:
+        return "critical"
+    return "normal"
+
+
+def _get_relative_time(notification: Notification) -> str:
+    try:
+        import time as _time
+
+        ts = getattr(notification, "time", None)
+        if ts is None:
+            return ""
+        diff = _time.time() - float(ts)
+        if diff < 60:
+            return "now"
+        mins = int(diff / 60)
+        if mins < 60:
+            return f"{mins}m ago"
+        hours = int(mins / 60)
+        if hours < 24:
+            return f"{hours}h ago"
+        return f"{int(hours / 24)}d ago"
+    except Exception:
+        return ""
+
+
+class NotificationWidget(Box):
+    def __init__(
+        self,
+        notification: Notification,
+        timeout_ms=None,
+        show_close_button=True,
+        name="notification",
+        **kwargs,
+    ):
+        if timeout_ms is None:
+            timeout_ms = self._get_current_notification_timeout()
+
+        self.show_close_button = show_close_button
+        self.close_button = None
+        self._is_hovered = False
+        self.notification_image_cache_key = None
+        self.app_icon_source = notification.app_icon
+        self._should_cleanup_cache = False
+
+        content_box = Box(
+            name=f"{name}-inner-content",
+            orientation="v",
+            children=[
+                self.create_content(notification),
+                self.create_action_buttons(notification),
+            ],
+        )
+
+        self.hover_event_box = EventBox(
+            events=["enter-notify-event", "leave-notify-event"], child=content_box
+        )
+        self.hover_event_box.connect("enter-notify-event", self._on_enter_notify)
+        self.hover_event_box.connect("leave-notify-event", self._on_leave_notify)
+
+        super().__init__(
+            size=(NOTIFICATION_WIDTH, -1),
+            name=name,
+            orientation="v",
+            h_align="fill",
+            h_expand=True,
+            children=[self.hover_event_box],
+        )
+
+        # Apply urgency CSS class
+        self.get_style_context().add_class(_get_urgency_class(notification))
+
+        self.notification = notification
+        self.timeout_ms = timeout_ms
+        self._timeout_id = None
+
+        self.start_timeout()
+        self.show_all()
+
+    def create_header(self, notification):
+        """Create notification header with app name + time"""
+        return Label(
+            notification.app_name or "",
+            name="notification-app-name",
+            h_align="start",
+            ellipsization="end",
+        )
+
+    def create_content(self, notification):
+        return Box(
+            name="notification-content",
+            orientation="v",
+            spacing=6,
+            children=[
+                Box(
+                    spacing=8,
+                    children=[
+                        ClippingBox(
+                            name="notification-image",
+                            children=Image(
+                                pixbuf=self._get_notification_pixbuf(notification)
+                            ),
+                        ),
+                        Box(
+                            name="notification-text",
+                            orientation="v",
+                            v_align="center",
+                            h_expand=True,
+                            children=[
+                                self.create_header(notification),
+                                Label(
+                                    name="notification-summary",
+                                    markup=escape_markup_text(
+                                        notification.summary.replace("\n", " ")
+                                    ),
+                                    h_align="start",
+                                    max_chars_width=38,
+                                    ellipsization="end",
+                                ),
+                                (
+                                    Label(
+                                        markup=escape_markup_text(
+                                            notification.body.replace("\n", " ")
+                                        ),
+                                        h_align="start",
+                                        max_chars_width=42,
+                                        ellipsization="end",
+                                    )
+                                    if notification.body
+                                    else Box()
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+    def _on_enter_notify(self, widget, event):
+        if hasattr(event, "detail") and event.detail == Gdk.NotifyType.INFERIOR:
+            return False
+        self._is_hovered = True
+        self.pause_timeout()
+        return False
+
+    def _on_leave_notify(self, widget, event):
+        if hasattr(event, "detail") and event.detail == Gdk.NotifyType.INFERIOR:
+            return False
+        self._is_hovered = False
+        self.resume_timeout()
+        return False
+
+    def get_pixbuf(self, icon_path, width, height):
+        """Get pixbuf with caching support"""
+        try:
+            # Use the icon caching system
+            cached_pixbuf = cache_notification_icon(icon_path, (width, height))
+            if cached_pixbuf:
+                return cached_pixbuf
+        except Exception as e:
+            logger.warning(f"Failed to get cached pixbuf for {icon_path}: {e}")
+
+        # Fallback to original method if caching fails
+        if icon_path.startswith("file://"):
+            icon_path = icon_path[7:]
+
+        if not os.path.exists(icon_path):
+            return get_fallback_notification_icon((width, height))
+
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(icon_path)
+            if pixbuf:
+                return pixbuf.scale_simple(width, height, GdkPixbuf.InterpType.BILINEAR)
+            else:
+                return get_fallback_notification_icon((width, height))
+        except Exception as e:
+            logger.error(f"Failed to load or scale icon: {e}")
+            return get_fallback_notification_icon((width, height))
+
+    def _get_notification_pixbuf(self, notification):
+        """Notification pixbuf — loads notification image or app icon, scaled consistently."""
+        return get_notification_pixbuf(
+            notification,
+            target_size=(NOTIFICATION_IMAGE_SIZE, NOTIFICATION_IMAGE_SIZE),
+            include_live_image=True,
+        )
+
+    def create_action_buttons(self, notification):
+        if not notification.actions:
+            return Box(name="notification-action-buttons", visible=False)
+
+        action_box = Box(
+            name="notification-action-buttons",
+            spacing=4,
+            h_expand=True,
+            children=[
+                ActionButton(action, i, len(notification.actions), self)
+                for i, action in enumerate(notification.actions)
+            ],
+        )
+
+        revealer = Revealer(
+            transition_type="slide-up",
+            transition_duration=250,
+            child=action_box,
+            reveal_child=False,
+        )
+
+        # Wrap in EventBox to catch hover events specifically for the bottom area
+        event_box = EventBox(
+            name="notification-action-buttons-container",
+            events=["enter-notify-event", "leave-notify-event"],
+            child=revealer,
+        )
+        # Give it a tiny minimum height so there's an invisible hit-zone to trigger the reveal
+        event_box.set_size_request(-1, 12)
+
+        def _on_enter(*_):
+            revealer.set_reveal_child(True)
+            return False
+
+        def _on_leave(*_):
+            revealer.set_reveal_child(False)
+            return False
+
+        event_box.connect("enter-notify-event", _on_enter)
+        event_box.connect("leave-notify-event", _on_leave)
+
+        return event_box
+
+    def start_timeout(self):
+        self.stop_timeout()
+        self._timeout_id = GLib.timeout_add(self.timeout_ms, self.close_notification)
+
+    def stop_timeout(self):
+        if self._timeout_id is not None:
+            GLib.source_remove(self._timeout_id)
+            self._timeout_id = None
+
+    def close_notification(self):
+        self.notification.close("expired")
+        self.stop_timeout()
+        return False
+
+    def pause_timeout(self):
+        self.stop_timeout()
+
+    def resume_timeout(self):
+        if not self._is_hovered:  # Only resume if not hovered
+            self.start_timeout()
+
+    def _manual_close(self):
+        """Handle manual close button click - just close notification"""
+        self.notification.close("dismissed-by-user")
+
+    def destroy(self):
+        self.stop_timeout()
+        # Only clean up caches if this was a manual dismissal
+        if self._should_cleanup_cache:
+            cleanup_notification_specific_caches(
+                app_icon_source=getattr(self, "app_icon_source", None),
+                notification_image_cache_key=getattr(
+                    self, "notification_image_cache_key", None
+                ),
+            )
+        else:
+            logger.debug("Preserved caches for timeout/auto-dismissed notification")
+        super().destroy()
+
+    # @staticmethod
+    def set_pointer_cursor(self, widget, cursor_name):
+        window = widget.get_window()
+        if window:
+            cursor = Gdk.Cursor.new_from_name(widget.get_display(), cursor_name)
+            window.set_cursor(cursor)
+
+    def hover_button(self, button):
+        self.pause_timeout()
+        self.set_pointer_cursor(button, "hand2")
+
+    def unhover_button(self, button):
+        # Don't resume timeout here since the notification itself might still be hovered
+        self.set_pointer_cursor(button, "arrow")
+
+    @staticmethod
+    def _get_current_notification_timeout():
+        """Get the current notification timeout from config manager."""
+        try:
+            timeout_str = get_config(
+                "notification.timeout", data.NOTIFICATION_TIMEOUT_STR
+            )
+            from shared.data import parse_timeout_string
+
+            return parse_timeout_string(timeout_str)
+        except Exception as e:
+            logger.warning(f"Failed to get notification timeout from config: {e}")
+            return data.NOTIFICATION_TIMEOUT
+
+
+class NotificationRevealer(CloseButtonRevealerMixin, SlideRevealer):
+    def __init__(
+        self,
+        notification: Notification,
+        on_transition_end=None,
+        parent_window=None,
+        **kwargs,
+    ):
+        self.notif_box = NotificationWidget(notification, show_close_button=True)
+        self.notification = notification
+        self.on_transition_end = on_transition_end
+        self.parent_window = parent_window
+        self._is_closing = False
+
+        # Close button pinned to top-right of the whole popup
+        self.close_button = Button(
+            name="notification-close-button",
+            image=CustomImage(icon_name="close-symbolic", icon_size=14),
+            on_clicked=lambda *_: self._manual_close(),
+        )
+        self.close_button.set_halign(Gtk.Align.CENTER)
+        self.close_button.set_valign(Gtk.Align.CENTER)
+        setup_cursor_hover(self.close_button)
+
+        self._is_close_button_hovered = False
+        self._hovered = False
+        self._close_button_hide_timeout_id = None
+
+        self.close_button_event_box = EventBox(
+            events=["enter-notify-event", "leave-notify-event"],
+            child=self.close_button,
+        )
+        self.close_button_event_box.connect(
+            "enter-notify-event", self._on_close_button_enter
+        )
+        self.close_button_event_box.connect(
+            "leave-notify-event", self._on_close_button_leave
+        )
+
+        self.close_button_revealer = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.CROSSFADE,
+            transition_duration=200,
+            child=self.close_button_event_box,
+            halign=Gtk.Align.END,
+            valign=Gtk.Align.START,
+            reveal_child=False,
+        )
+
+        # Enhanced swipe detection variables for Android-style animation
+        self._drag_start_y = 0
+        self._drag_start_x = 0
+        self._is_dragging = False
+        self._swipe_threshold = 80  # Distance to trigger auto-dismiss
+        self._swipe_velocity_threshold = (
+            150  # Velocity to trigger dismiss even on shorter swipes
+        )
+        self._swipe_in_progress = False
+        self._current_offset = 0
+        self._last_drag_time = 0
+        self._last_drag_x = 0
+        self._drag_velocity = 0
+        self._spring_back_duration = 200  # Duration for spring-back animation
+        self._dismiss_threshold = 0.3  # Dismiss if swiped 30% of width
+
+        # Animation state
+        self._animation_in_progress = False
+        self._spring_timer_id = None
+        self._anim_timeout_id = None
+
+        # Wrap notification in EventBox for swipe detection
+        self.event_box = EventBox(
+            events=[
+                "button-press-event",
+                "button-release-event",
+                "motion-notify-event",
+                "enter-notify-event",
+                "leave-notify-event",
+            ],
+            child=self.notif_box,
+        )
+        self.event_box.connect("enter-notify-event", self._on_hover_enter)
+        self.event_box.connect("leave-notify-event", self._on_hover_leave)
+        self.event_box.connect("button-press-event", self._on_button_press)
+        self.event_box.connect("button-release-event", self._on_button_release)
+        self.event_box.connect("motion-notify-event", self._on_motion_notify)
+
+        # Overlay so close button sits at top-right of the whole popup
+        self._popup_overlay = Gtk.Overlay()
+        self._popup_overlay.add(self.event_box)
+        self._popup_overlay.add_overlay(self.close_button_revealer)
+        self._popup_overlay.show_all()
+
+        super().__init__(
+            child=self._popup_overlay,
+            direction="right",
+            duration=280,
+        )
+
+        smooth_revealer_animation(self)
+
+        # Connect our own handler that manages the slide animation - track ID for cleanup
+        self._closed_handler_id = self.notification.connect("closed", self.on_resolved)
+
+        self._animation_in_progress = True
+
+    def _ease_out_cubic(self, t):
+        """Smoother easing function for better animation quality"""
+        return 1 - pow(1 - t, 3)
+
+    def _on_button_press(self, widget, event):
+        if event.button != 1:
+            return False
+        self._is_dragging = True
+        self._drag_start_x = event.x_root
+        self._drag_start_y = event.y_root
+        self._current_offset = 0
+        self._last_drag_time = GLib.get_monotonic_time() / 1000
+        self._last_drag_x = event.x_root
+        self._drag_velocity = 0
+        if self._spring_timer_id:
+            GLib.source_remove(self._spring_timer_id)
+            self._spring_timer_id = None
+        return False
+
+    def _on_button_release(self, widget, event):
+        if not self._is_dragging:
+            return False
+        self._is_dragging = False
+        if (
+            abs(self._current_offset) > NOTIFICATION_WIDTH * self._dismiss_threshold
+            or abs(self._drag_velocity) > self._swipe_velocity_threshold
+        ):
+            self._swipe_in_progress = True
+            self._animate_dismiss(self._current_offset)
+        else:
+            self._animate_spring_back()
+        return False
+
+    def _on_motion_notify(self, widget, event):
+        if not self._is_dragging:
+            return False
+        current_x = event.x_root
+        delta_x = current_x - self._drag_start_x
+        if delta_x <= 0:
+            return False
+        self._current_offset = delta_x
+        self._calculate_drag_velocity(current_x)
+        self._fixed.move(self.child, round(delta_x), 0)
+        progress = min(1.0, delta_x / NOTIFICATION_WIDTH)
+        self.child.set_opacity(1.0 - (progress * 0.5))
+        return False
+
+    def _animate_spring_back(self):
+        if self._spring_timer_id:
+            GLib.source_remove(self._spring_timer_id)
+        start_offset = self._current_offset
+        start_time = GLib.get_monotonic_time() / 1000
+        duration = 200
+
+        def step():
+            elapsed = (GLib.get_monotonic_time() / 1000) - start_time
+            progress = min(1.0, elapsed / duration)
+            eased = self._ease_out_cubic(progress)
+            offset = start_offset * (1.0 - eased)
+            self._fixed.move(self.child, round(offset), 0)
+            self.child.set_opacity(1.0 - (abs(offset) / NOTIFICATION_WIDTH * 0.5))
+            if progress >= 1.0:
+                self._fixed.move(self.child, 0, 0)
+                self.child.set_opacity(1.0)
+                self._spring_timer_id = None
+                return False
+            return True
+
+        self._spring_timer_id = GLib.timeout_add(16, step)
+
+    def _ease_out_quart(self, t):
+        """Even smoother easing for ultra-smooth animations"""
+        return 1 - pow(1 - t, 4)
+
+    def _animate_dismiss(self, start_offset):
+        """Animate the notification sliding out with smooth 60fps animation"""
+        target_offset = NOTIFICATION_WIDTH + 50
+
+        if self._spring_timer_id:
+            GLib.source_remove(self._spring_timer_id)
+
+        start_time = GLib.get_monotonic_time() / 1000
+        offset_diff = target_offset - start_offset
+        duration = 200
+
+        def animate_step():
+            current_time = GLib.get_monotonic_time() / 1000
+            elapsed = current_time - start_time
+            progress = min(1.0, elapsed / duration)
+
+            eased_progress = self._ease_out_quart(progress)
+            current_offset = start_offset + (offset_diff * eased_progress)
+
+            self._fixed.move(self.child, round(current_offset), 0)
+            self.child.set_opacity(max(0.0, 1.0 - (progress * 0.9)))
+
+            if progress >= 1.0:
+                self.notif_box._should_cleanup_cache = True
+                try:
+                    self.notification.close("dismissed-by-user")
+                except Exception as e:
+                    logger.error(f"An error occurred: {e}")
+                return False
+
+            return True
+
+        self._animation_in_progress = True
+        self._spring_timer_id = GLib.timeout_add(16, animate_step)
+
+    def _calculate_drag_velocity(self, current_x):
+        """Calculate the velocity of the drag gesture"""
+        current_time = GLib.get_monotonic_time() / 1000
+
+        if self._last_drag_time > 0:
+            time_diff = current_time - self._last_drag_time
+            if time_diff > 0:
+                distance_diff = current_x - self._last_drag_x
+                self._drag_velocity = abs(distance_diff / time_diff)
+
+        self._last_drag_time = current_time
+        self._last_drag_x = current_x
+
+    def _on_animation_complete(self, is_hiding=False):
+        if is_hiding:
+            # Manually destroy the notification widget since we disconnected its handler
+            self.notif_box.destroy()
+
+            if self.on_transition_end:
+                self.on_transition_end()
+            self.destroy()
+
+    def on_resolved(
+        self,
+        _notification: Notification,
+        reason: NotificationCloseReason,
+    ):
+        if self._is_closing:
+            return
+
+        self._is_closing = True
+
+        # Clean up any ongoing animations
+        if self._spring_timer_id:
+            GLib.source_remove(self._spring_timer_id)
+            self._spring_timer_id = None
+
+        # Swipe already animated the child off-screen — skip revealer animation
+        if self._swipe_in_progress:
+            self.notif_box.destroy()
+            if self.on_transition_end:
+                self.on_transition_end()
+            self.destroy()
+            return
+
+        # Use different slide directions based on dismiss reason
+        if reason == "expired":
+            self.set_slide_direction("left")
+            self.duration = 250
+        else:
+            self.set_slide_direction("right")
+            self.duration = 200
+
+        self.hide()
+        # Consistent timing for smooth transitions
+        timeout_duration = self.duration + 50
+        self._anim_timeout_id = GLib.timeout_add(
+            timeout_duration, lambda: self._on_animation_complete(True)
+        )
+
+    def _manual_close(self):
+        self.notif_box._should_cleanup_cache = True
+        self.notification.close("dismissed-by-user")
+
+    def destroy(self):
+        # Clean up timers
+        self._cancel_close_button_hide()
+        if self._spring_timer_id:
+            GLib.source_remove(self._spring_timer_id)
+            self._spring_timer_id = None
+        if self._anim_timeout_id:
+            GLib.source_remove(self._anim_timeout_id)
+            self._anim_timeout_id = None
+
+        # Disconnect notification signal
+        if hasattr(self, "_closed_handler_id") and self._closed_handler_id:
+            try:
+                self.notification.disconnect(self._closed_handler_id)
+            except Exception as e:
+                logger.error(f"An error occurred: {e}")
+            self._closed_handler_id = 0
+
+        super().destroy()
+
+
+class NotificationState:
+    IDLE = 0
+    SHOWING = 1
+    HIDING = 2
+    TRANSITIONING = 3  # New state for smooth transitions
+
+
+class ModusNoti(Window):
+    def __init__(self):
+        # Local config state mirroring services.config usage
+        self._current_config = {
+            "notification_timeout": data.NOTIFICATION_TIMEOUT_STR,
+            "notification_ignored_apps": data.NOTIFICATION_IGNORED_APPS_HISTORY,
+            "notification_limited_apps_history": data.NOTIFICATION_LIMITED_APPS_HISTORY,
+        }
+
+        # Subscribe to config changes and apply initial config
+        on_config_change(self._on_config_changed)
+        self._apply_initial_config()
+
+        self._server = notification_service
+
+        self.notifications = Box(
+            v_expand=True,
+            h_expand=True,
+            style="margin: 1px 0px 1px 1px;",
+            orientation="v",
+            spacing=5,
+        )
+
+        # Enhanced queue system for ultra-smooth transitions
+        self.notification_queue = []
+        self.current_notification = None
+        self.notification_state = NotificationState.IDLE
+        self._transition_timer_id = None
+        self._debounce_timer_id = None
+        self._last_notification_time = 0
+
+        # Queue management settings for smooth behavior
+        self.MAX_QUEUE_SIZE = 3  # Limit queue to prevent overwhelming
+        self.TRANSITION_DELAY = 100  # Smoother transition timing
+        self.DEBOUNCE_DELAY = 50  # Prevent rapid fire notifications
+
+        self._notification_added_handler_id = self._server.connect(
+            "notification-added", self.on_new_notification
+        )
+        Window.__init__(
+            self,
+            anchor="top right",
+            child=self.notifications,
+            layer="overlay",
+            title="modus-notifications",  # More specific title for debugging
+            all_visible=True,
+            visible=False,  # Start hidden, show only when we have content
+            exclusive=False,
+        )
+
+    def on_new_notification(self, fabric_notif, id):
+        notification: Notification = fabric_notif.get_notification_from_id(id)
+
+        # Check if notification still exists (might have been removed already)
+        if not notification:
+            return
+
+        if self._server.dont_disturb or modus_service.dont_disturb:
+            # Notification is already cached by the service, just don't show popup
+            return
+
+        # Check if notification should be ignored based on current config
+        if self._should_ignore_notification(notification):
+            return
+
+        # Preload assets immediately for optimal caching and display performance
+        preload_notification_assets(notification)
+
+        # If queue is getting full, remove oldest notifications smoothly
+        if len(self.notification_queue) >= self.MAX_QUEUE_SIZE:
+            # Remove oldest notification from queue (not current showing one)
+            if self.notification_queue:
+                oldest = self.notification_queue.pop(0)
+                try:
+                    oldest.close("dismissed-by-user")
+                except Exception as e:
+                    logger.error(f"An error occurred: {e}")
+
+        # Add new notification to queue
+        self.notification_queue.append(notification)
+
+        # Debounce rapid notifications for smoother experience
+        if self._debounce_timer_id:
+            GLib.source_remove(self._debounce_timer_id)
+
+        self._debounce_timer_id = GLib.timeout_add(
+            self.DEBOUNCE_DELAY,
+            lambda: self._process_notification_queue_debounced() or False,
+        )
+
+    def _process_notification_queue_debounced(self):
+        """Process queue after debounce delay for smooth transitions"""
+        self._debounce_timer_id = None
+        self._process_notification_queue()
+        return False
+
+    def _process_notification_queue(self):
+        # If we're currently showing a notification and there's a new one in queue
+        if (
+            self.notification_state == NotificationState.SHOWING
+            and self.current_notification
+            and self.notification_queue
+        ):
+            # Smooth transition: start hiding current notification
+            self.notification_state = NotificationState.TRANSITIONING
+            self._start_smooth_transition()
+
+        elif (
+            self.notification_state == NotificationState.IDLE
+            and self.notification_queue
+        ):
+            # If we're idle and have notifications in queue, show the next one
+            self._show_next_notification()
+
+    def _start_smooth_transition(self):
+        """Start smooth transition between notifications"""
+        if self.current_notification and not self.current_notification._is_closing:
+            # Don't mark for cache cleanup during smooth transitions
+            # to maintain performance
+
+            # Use shorter timeout for smooth transitions
+            self.current_notification.notif_box.timeout_ms = 100
+
+            # Force close current notification with smooth animation
+            try:
+                self.current_notification.notification.close("expired")
+            except Exception as e:
+                logger.error(f"An error occurred: {e}")
+
+    def _show_next_notification(self):
+        if (
+            not self.notification_queue
+            or self.notification_state != NotificationState.IDLE
+        ):
+            return
+
+        notification = self.notification_queue.pop(0)
+
+        # Check if notification is still valid (might have been removed)
+        if not notification or not hasattr(notification, "app_icon"):
+            # Skip invalid notifications and try next one
+            if self.notification_queue:
+                self._show_next_notification()
+            return
+
+        self.notification_state = NotificationState.SHOWING
+
+        new_box = NotificationRevealer(
+            notification,
+            on_transition_end=lambda: self._on_notification_finished(new_box),
+            parent_window=self,
+        )
+
+        self.current_notification = new_box
+
+        # Clear and destroy any existing children
+        for child in list(self.notifications.children):
+            try:
+                self.notifications.remove(child)
+                child.destroy()
+            except Exception as e:
+                logger.error(f"An error occurred: {e}")
+
+        self.notifications.children = [new_box]
+
+        # Show the window now that we have content to display
+        self.set_visible(True)
+
+        new_box.show()
+        self.notifications.queue_resize()
+
+        def start_animation():
+            # Stop polling if the revealer is already closing/destroyed —
+            # _on_notification_finished may have fired between the idle_add
+            # and this callback executing.
+            if new_box._is_closing:
+                return False
+            if new_box.get_parent() and new_box.get_realized():
+                new_box.reveal()
+                return False
+            return True
+
+        GLib.idle_add(start_animation)
+
+    def _on_notification_finished(self, notification_box):
+        if notification_box != self.current_notification:
+            return
+
+        # Cancel any pending transition timer
+        if self._transition_timer_id:
+            GLib.source_remove(self._transition_timer_id)
+            self._transition_timer_id = None
+
+        # Safely remove and destroy notification box
+        try:
+            if notification_box in self.notifications.children:
+                self.notifications.remove(notification_box)
+            notification_box.destroy()
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
+
+        # Reset state
+        self.current_notification = None
+        self.notification_state = NotificationState.IDLE
+
+        # Process next notification with optimized delay for ultra-smooth transitions
+        if self.notification_queue:
+            self._transition_timer_id = GLib.timeout_add(
+                self.TRANSITION_DELAY,  # Consistent smooth timing
+                lambda: self._show_next_notification() or False,
+            )
+        else:
+            # Hide window when no more notifications to show
+            self.set_visible(False)
+
+    def show_next_notification(self):
+        # Legacy method for compatibility - redirect to new implementation
+        self._show_next_notification()
+
+    def on_notification_finished(self, notification_box):
+        # Legacy method for compatibility - redirect to new implementation
+        self._on_notification_finished(notification_box)
+
+    def clear_notification_queue(self):
+        """Clear queue with smooth cleanup"""
+        queue_length = len(self.notification_queue)
+        if queue_length > 0:
+            # Smooth dismissal of queued notifications
+            for notification in list(self.notification_queue):
+                try:
+                    notification.close("dismissed-by-user")
+                except Exception as e:
+                    logger.error(f"An error occurred: {e}")
+            self.notification_queue.clear()
+
+        # Also clean current notification if showing
+        if self.current_notification:
+            self.current_notification.notif_box._should_cleanup_cache = True
+            try:
+                self.current_notification.notification.close("dismissed-by-user")
+            except Exception as e:
+                logger.error(f"An error occurred: {e}")
+
+        # Clear animation timers
+        if self._transition_timer_id:
+            GLib.source_remove(self._transition_timer_id)
+            self._transition_timer_id = None
+
+        if self._debounce_timer_id:
+            GLib.source_remove(self._debounce_timer_id)
+            self._debounce_timer_id = None
+
+    def get_queue_length(self):
+        return len(self.notification_queue)
+
+    def _should_ignore_notification(self, notification):
+        """Check if notification should be ignored based on current config."""
+        try:
+            ignored_apps = self._current_config.get("notification_ignored_apps", [])
+            app_name = getattr(notification, "app_name", "")
+
+            # Check if app name is in ignored list
+            return app_name in ignored_apps
+        except Exception as e:
+            logger.warning(f"Failed to check if notification should be ignored: {e}")
+            return False
+
+    def update_config(self, new_config):
+        """Update notification configuration dynamically."""
+        try:
+            # Update the current config
+            self._current_config.update(new_config)
+
+        except Exception as e:
+            logger.error(f"[ModusNoti] Failed to update config: {e}")
+
+    def _apply_initial_config(self):
+        try:
+            timeout_val = get_config(
+                "notification.timeout", data.NOTIFICATION_TIMEOUT_STR
+            )
+            ignored_apps = get_config(
+                "notification.ignored_apps", data.NOTIFICATION_IGNORED_APPS_HISTORY
+            )
+            limited_apps = get_config(
+                "notification.limited_apps_history",
+                data.NOTIFICATION_LIMITED_APPS_HISTORY,
+            )
+            initial = {
+                "notification_timeout": timeout_val,
+                "notification_ignored_apps": ignored_apps,
+                "notification_limited_apps_history": limited_apps,
+            }
+            # Only apply if different
+            self.update_config(initial)
+        except Exception as e:
+            logger.error(f"[ModusNoti] Failed to apply initial config: {e}")
+
+    def _on_config_changed(self, new_config: dict, old_config: dict):
+        try:
+            new_notif = new_config.get("notification", {})
+            old_notif = old_config.get("notification", {})
+            changes = {}
+            key_map = {
+                "timeout": "notification_timeout",
+                "ignored_apps": "notification_ignored_apps",
+                "limited_apps_history": "notification_limited_apps_history",
+            }
+            for new_key, local_key in key_map.items():
+                if new_key in new_notif and new_notif.get(new_key) != old_notif.get(
+                    new_key
+                ):
+                    changes[local_key] = new_notif.get(new_key)
+
+            if changes:
+                self.update_config(changes)
+        except Exception as e:
+            logger.error(f"[ModusNoti] Error handling config change: {e}")
+
+    def destroy(self):
+        off_config_change(self._on_config_changed)
+        if self._transition_timer_id:
+            GLib.source_remove(self._transition_timer_id)
+            self._transition_timer_id = None
+        if self._debounce_timer_id:
+            GLib.source_remove(self._debounce_timer_id)
+            self._debounce_timer_id = None
+        if self._notification_added_handler_id:
+            try:
+                self._server.disconnect(self._notification_added_handler_id)
+            except Exception as e:
+                logger.error(f"[ModusNoti] Failed to disconnect server: {e}")
+            self._notification_added_handler_id = None
+        self.clear_notification_queue()
+        super().destroy()

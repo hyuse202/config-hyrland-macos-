@@ -1,0 +1,47 @@
+/* ── GtkMenu global styles  ── */
+
+.background.popup {
+  background: transparent;
+}
+
+/* GtkMenu container */
+menu {
+  background-color: @glass-popup;
+  border: 1px solid @glass-border;
+  border-radius: 0.75rem;
+  padding: 0.5rem;
+}
+
+/* GtkMenuItem */
+menu menuitem {
+  border-radius: apply(radius-xs);
+  padding: 0px 10px;
+  margin: 1px 2px;
+  color: @glass-text;
+  transition: all 0ms ease-in-out;
+}
+
+/* GtkMenuItem hover */
+menu menuitem:hover {
+  background-color: @glass-hover;
+  color: @glass-text;
+}
+
+/* GtkMenuItem label */
+menu menuitem label {
+  font-size: apply(font-md);
+  margin: 0px;
+  color: inherit;
+  font-weight: 400;
+}
+
+/* Submenu arrow */
+menu menuitem arrow {
+  color: @glass-text-secondary;
+}
+
+/* Disabled */
+menu menuitem:disabled {
+  color: @glass-text-disabled;
+  opacity: 0.5;
+}

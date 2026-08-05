@@ -1,0 +1,17 @@
+
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+config/config.toml
+config/dock.toml
+config/hypr/colors.conf
+src/styles/colors.css
+.aider*
+.venv/*
+.venv/
+config/plugins/
+config/desktop.toml
+config/matugen/colors.lua
+src/assets/wallpaper_example/.thumbnails/

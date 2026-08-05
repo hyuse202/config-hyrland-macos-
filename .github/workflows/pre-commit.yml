@@ -1,0 +1,25 @@
+name: Pre-commit
+
+on:
+  push:
+    branches: [macos]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - uses: pre-commit/action@v3.0.1

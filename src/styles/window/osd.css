@@ -1,0 +1,25 @@
+#osd-container {
+    background-color: @glass-popup;
+    padding: 12px 20px;
+    margin: 70px;
+    min-width: 180px;
+    min-height: 200px;
+    border-radius: apply(radius-lg);
+    border: 1px solid @glass-border-soft;
+}
+
+#osd-container .block-progress-bar {
+    min-height: 12px;
+}
+
+#osd-container .block-progress-bar block-bg {
+    background-color: alpha(@glass-surface-1, 0.6);
+}
+
+#osd-container .block-progress-bar block-fg {
+    background-color: @glass-accent;
+}
+
+#osd-container .block-progress-bar.muted block-fg {
+    background-color: alpha(@glass-surface-1, 0.3);
+}
